@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+exec >/dev/null 2>&1
 KERNEL_MAJOR=$(uname -r | cut -d. -f1)
 KERNEL_MINOR=$(uname -r | cut -d. -f2)
 if [ "$KERNEL_MAJOR" -lt 4 ] || { [ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -lt 9 ]; }; then
-    echo "<4.9！BBR???" >&2
     exit 1
 fi
 OS="unknown"
@@ -12,7 +12,6 @@ BANDWIDTH_MBPS="200"
 SWAPPINESS_VAL="10"
 BUSY_POLL_VAL="0"
 INITCWND_DONE="false"
-err() { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 detect_os() {
     if [ -f /etc/os-release ]; then . /etc/os-release; ID="${ID:-}"; ID_LIKE="${ID_LIKE:-}"; fi
     if [ -f /etc/alpine-release ]; then OS="alpine"
@@ -25,6 +24,24 @@ detect_os() {
             *[Dd][Ee][Bb][Ii][Aa][Nn]*|*[Uu][Bb][Uu][Nn][Tt][Uu]*) OS="debian" ;;
             *[Cc][Ee][Nn][Tt][Oo][Ss]*|*[Rr][Hh][Ee][Ll]*|*[Ff][Ee][Dd][Oo][Rr][Aa]*) OS="redhat" ;;
         esac
+    fi
+}
+setup_swap_and_timesync() {
+    if ! swapon --show 2>/dev/null | grep -q '^/'; then
+        swapoff -a 2>/dev/null || true
+        fallocate -l 2G /swap || dd if=/dev/zero of=/swap bs=1M count=2048 status=none
+        chmod 600 /swap
+        mkswap /swap
+        swapon -p 100 /swap
+        if ! grep -q "^/swap " /etc/fstab; then
+            echo "/swap swap swap defaults,pri=100 0 0" >> /etc/fstab
+        fi
+    fi
+    if [ "$OS" = "debian" ]; then
+        if command -v apt >/dev/null 2>&1; then
+            apt update -qq && apt install -y -qq systemd-timesyncd
+            systemctl enable --now systemd-timesyncd 2>/dev/null || true
+        fi
     fi
 }
 get_cpu_core() {
@@ -95,6 +112,9 @@ apply_initcwnd_optimization() {
 }
 setup_zrm_swap() {
     local mt="$1"
+    if swapon --show 2>/dev/null | grep -q '^/'; then
+        return 0
+    fi
     { [ -z "$mt" ] || [ "$mt" -ge 600 ]; } && return 0
     grep -q "zram0" /proc/swaps && return 0
     if ! modprobe zram 2>/dev/null; then [ "$OS" = "alpine" ] && apk add linux-virt-modules >/dev/null 2>&1 && modprobe zram 2>/dev/null; fi
@@ -214,7 +234,7 @@ optimize_system() {
     apply_initcwnd_optimization "true"
     apply_nic_core_boost "$real_c" "$net_bgt" "$net_usc" "$mem_total" "$target_qlen" "$t_usc" "$ring"
     if ! lsmod | grep -q "^tcp_bbr" 2>/dev/null; then
-        if ! modprobe tcp_bbr 2>/dev/null; then err " slow~ "; exit 1; fi
+        if ! modprobe tcp_bbr 2>/dev/null; then exit 1; fi
     fi
     if [ -d /etc/modules-load.d ]; then echo "tcp_bbr" > /etc/modules-load.d/99-bbr.conf
     else grep -q "^tcp_bbr" /etc/modules 2>/dev/null || echo "tcp_bbr" >> /etc/modules; fi
@@ -297,11 +317,32 @@ net.ipv4.tcp_max_syn_backlog = 512
 LOWMEM
 )
 SYSCTL
+    local extra_params=(
+        "fs.file-max = 6815744"
+        "net.ipv4.tcp_max_syn_backlog = 8192"
+        "net.ipv4.tcp_abort_on_overflow = 1"
+        "net.ipv4.tcp_rfc1337 = 1"
+        "net.ipv4.tcp_fack = 1"
+        "net.ipv4.tcp_adv_win_scale = 2"
+        "net.ipv4.udp_rmem_min = 8192"
+        "net.ipv4.udp_wmem_min = 8192"
+        "net.ipv4.tcp_timestamps = 1"
+        "net.ipv4.conf.all.rp_filter = 0"
+        "net.ipv4.conf.default.rp_filter = 0"
+        "net.ipv4.conf.all.route_localnet = 1"
+    )
+    for entry in "${extra_params[@]}"; do
+        param_name="${entry%% = *}"
+        if ! grep -q "^${param_name} = " "$SYSCTL_FILE" 2>/dev/null; then
+            echo "$entry" >> "$SYSCTL_FILE"
+        fi
+    done
     if command -v sysctl >/dev/null 2>&1; then
         sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
     fi
 }
 detect_os
+setup_swap_and_timesync
 CPU_CORE=$(get_cpu_core)
 optimize_system
 exit 0
