@@ -1,4 +1,4 @@
-### - [Liberty or death！Fuck autocracy！](https://telegram.me/Nyarvexxx)
+### [Liberty or death！Fuck autocracy！](https://telegram.me/Nyarvexxx)
 
 
 ---
