@@ -1,21 +1,703 @@
-import{connect as cloudflareConnect}from'cloudflare:sockets';
-const PEER_UUID='ca6a7a70-4d44-433f-b727-1ed22ae7bf23';
-const FALLBACK_HOSTS=['ProxyIP.CMLiussss.net','ProxyIP.HK.CMLiussss.net','ProxyIP.SG.CMLiussss.net','ProxyIP.JP.CMLiussss.net','ProxyIP.KR.CMLiussss.net','ProxyIP.IN.CMLiussss.net','ProxyIP.GB.CMLiussss.net','ProxyIP.FR.CMLiussss.net','ProxyIP.DE.CMLiussss.net','ProxyIP.NL.CMLiussss.net','ProxyIP.SE.CMLiussss.net','ProxyIP.FI.CMLiussss.net','ProxyIP.PL.CMLiussss.net','ProxyIP.RU.CMLiussss.net','ProxyIP.CH.CMLiussss.net','ProxyIP.LV.CMLiussss.net','ProxyIP.US.CMLiussss.net','ProxyIP.CA.CMLiussss.net','kr.william.us.ci','tw.william.us.ci','proxy.mia.xx.kg'];
-function getRandomFallback(){const idx=Math.floor(Math.random()*FALLBACK_HOSTS.length);return FALLBACK_HOSTS[idx];}
-const TUNNEL_CFG={READ_BUFFER_SIZE:128*1024,DOWN_BATCH_SIZE:64*1024,DOWN_TAIL_THRESHOLD:256,DOWN_FLUSH_DELAY:1,UP_BATCH_SIZE:32*1024,UP_QUEUE_LIMIT:128*1024,CONNECTION_RACE_COUNT:3,HEARTBEAT_INTERVAL:15000,STALL_TIMEOUT:8000,MAX_STALL_COUNT:12,MAX_RECONNECT_COUNT:15,DIRECT_SPEED_THRESHOLD:10*1024*1024,DIRECT_AVG_SIZE_THRESHOLD:16384,BUFFERED_SPEED_THRESHOLD:2*1024*1024,BUFFERED_AVG_SIZE_THRESHOLD:4096,ADAPTIVE_SAMPLE_INTERVAL:1000};
-const DoH='cloudflare-dns.com';
-const dohPath='dns-query';
-const CORS_MAX_BODY_SIZE=52428800;
-const UA_LIST=['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15','Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0','Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0','Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1','Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1','Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0'];
-function getRichHeaders(){const h=new Headers();h.set('User-Agent',UA_LIST[Math.floor(Math.random()*UA_LIST.length)]);h.set('Accept','text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7');h.set('Accept-Language','en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7');h.set('Accept-Encoding','gzip, deflate, br');h.set('Cache-Control','no-cache');h.set('DNT','1');h.set('Sec-Fetch-Dest','document');h.set('Sec-Fetch-Mode','navigate');h.set('Sec-Fetch-Site','none');h.set('Sec-Fetch-User','?1');h.set('Upgrade-Insecure-Requests','1');return h;}
-function base64UrlToBytes(header){if(!header)return null;try{const raw=atob(header.replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from(raw,c=>c.charCodeAt(0));}catch(_){return null;}}
-function createCoalescingQueue(maxBatchSize,maxQueueBytes=maxBatchSize,maxItems=Math.max(1,maxQueueBytes>>8)){let items=[];let head=0;let totalBytes=0;let batchBuffer=null;function trim(){if(head>32&&head*2>=items.length){items=items.slice(head);head=0;}}function pop(){if(head>=items.length)return null;const chunk=items[head];items[head++]=undefined;totalBytes-=chunk.byteLength;trim();return chunk;}return{get byteCount(){return totalBytes;},get length(){return items.length-head;},get isEmpty(){return head>=items.length;},reset(){items=[];head=0;totalBytes=0;},push(chunk){const size=chunk?.byteLength||0;if(!size)return 1;if(totalBytes+size>maxQueueBytes||(items.length-head)>=maxItems)return 0;items.push(chunk);totalBytes+=size;return 1;},pop,batch(firstChunk){if(firstChunk===undefined)firstChunk=pop();if(!firstChunk||head>=items.length||firstChunk.byteLength>=maxBatchSize){return[firstChunk,0];}let combinedSize=firstChunk.byteLength;let end=head;while(end<items.length){const next=items[end];const nextSize=combinedSize+next.byteLength;if(nextSize>maxBatchSize)break;combinedSize=nextSize;end++;}if(end===head)return[firstChunk,0];const buffer=batchBuffer||=new Uint8Array(maxBatchSize);buffer.set(firstChunk);let offset=firstChunk.byteLength;while(head<end){const next=items[head];items[head++]=undefined;totalBytes-=next.byteLength;buffer.set(next,offset);offset+=next.byteLength;}trim();return[buffer.subarray(0,combinedSize),1];},};}
-function createDownstreamBuffer(webSocket){const batchSize=TUNNEL_CFG.DOWN_BATCH_SIZE;const tailThreshold=TUNNEL_CFG.DOWN_TAIL_THRESHOLD;const flushThreshold=Math.max(4096,tailThreshold<<3);let buffer=new Uint8Array(batchSize);let pos=0;let flushTimer=0;let microtaskScheduled=0;let addCounter=0;let addSnapshot=0;let retryCount=0;function flush(){if(flushTimer)clearTimeout(flushTimer);flushTimer=0;microtaskScheduled=0;if(!pos)return;webSocket.send(buffer.subarray(0,pos));buffer=new Uint8Array(batchSize);pos=0;retryCount=0;}function scheduleFlush(){if(flushTimer||microtaskScheduled)return;microtaskScheduled=1;addSnapshot=addCounter;queueMicrotask(()=>{microtaskScheduled=0;if(!pos||flushTimer)return;if(batchSize-pos<tailThreshold)return flush();flushTimer=setTimeout(()=>{flushTimer=0;if(!pos)return;if(batchSize-pos<tailThreshold)return flush();if(retryCount<2&&(addCounter!==addSnapshot||pos<flushThreshold)){retryCount++;addSnapshot=addCounter;return scheduleFlush();}flush();},Math.max(TUNNEL_CFG.DOWN_FLUSH_DELAY,1));});}return{add(chunk){let offset=0;const len=chunk?.byteLength||0;if(!len)return;while(offset<len){if(!pos&&len-offset>=batchSize){const partSize=Math.min(batchSize,len-offset);webSocket.send(offset||partSize!==len?chunk.subarray(offset,offset+partSize):chunk);offset+=partSize;continue;}const partSize=Math.min(batchSize-pos,len-offset);buffer.set(chunk.subarray(offset,offset+partSize),pos);pos+=partSize;offset+=partSize;addCounter++;if(pos===batchSize||batchSize-pos<tailThreshold){flush();}else{scheduleFlush();}}},flush,};}
-function parseInitialMessage(packet){if(packet.length<19)throw new Error('Invalid packet');const uuidHex=[...packet.slice(1,17)].map(b=>b.toString(16).padStart(2,'0')).join('');if(uuidHex!==PEER_UUID.replace(/-/g,''))throw new Error('UUID mismatch');const addressLength=packet[17];let offset=18+addressLength+1;const port=(packet[offset]<<8)|packet[offset+1];offset+=2;const addrType=packet[offset++];let hostname='';if(addrType===1){hostname=[...packet.slice(offset,offset+4)].join('.');offset+=4;}else if(addrType===2){const len=packet[offset++];hostname=new TextDecoder().decode(packet.slice(offset,offset+len));offset+=len;}else if(addrType===3){const raw=packet.slice(offset,offset+16);hostname=[...Array(8)].map((_,idx)=>((raw[idx*2]<<8)|raw[idx*2+1]).toString(16)).join(':');offset+=16;}else{throw new Error('Unknown address type');}const payload=packet.slice(offset);return{hostname,port,payload};}
-function createConnection(hostname,port,initialData){const socket=cloudflareConnect({hostname,port});return new Promise((resolve,reject)=>{socket.opened.then(()=>{if(initialData?.byteLength){const writer=socket.writable.getWriter();writer.write(initialData).then(()=>{writer.releaseLock();resolve(socket);}).catch(reject);}else{resolve(socket);}}).catch(reject);});}
-function raceConnections(hostname,port,initialData){const raceCount=TUNNEL_CFG.CONNECTION_RACE_COUNT;if(raceCount<=1)return createConnection(hostname,port,initialData);const attempts=Array(raceCount).fill().map(()=>createConnection(hostname,port,initialData));return Promise.any(attempts).then(winner=>{attempts.forEach(p=>p.then(s=>{if(s!==winner)s.close();}).catch(()=>{}));return winner;});}
-async function upgradeHandler(request){const[clientWS,serverWS]=Object.values(new WebSocketPair());serverWS.accept({allowHalfOpen:true});serverWS.binaryType='arraybuffer';const earlyPayload=base64UrlToBytes(request.headers.get('sec-websocket-protocol')||'');const state={socket:null,writer:null,target:null,closed:false,reconnCount:0,stallCount:0,lastReadTime:Date.now(),lastWriteTime:Date.now(),heartbeatTimer:null,stallTimer:null,reconnecting:false,downMode:'adaptive'};const upstreamQueue=createCoalescingQueue(TUNNEL_CFG.UP_BATCH_SIZE,TUNNEL_CFG.UP_QUEUE_LIMIT);let processing=false;function teardown(){if(state.closed)return;state.closed=true;clearInterval(state.heartbeatTimer);clearInterval(state.stallTimer);upstreamQueue.reset();try{state.writer?.releaseLock();}catch(_){}try{state.socket?.close();}catch(_){}try{serverWS.close();}catch(_){}}function asUint8Array(data){if(data instanceof Uint8Array)return data;if(ArrayBuffer.isView(data)){return new Uint8Array(data.buffer,data.byteOffset,data.byteLength);}return new Uint8Array(data);}function enqueue(data){const chunk=asUint8Array(data);if(!chunk.byteLength)return 1;if(upstreamQueue.push(chunk))return 1;teardown();return 0;}async function pipeSocketToWebSocket(readable,webSocket,stateRef){const reader=readable.getReader({mode:'byob'});const downstream=createDownstreamBuffer(webSocket);let buf=new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);let downBytes=0;let downPackets=0;let lastSampleTime=Date.now();let currentMode='adaptive';const updateDownMode=(size)=>{downBytes+=size;downPackets++;const now=Date.now();if(now-lastSampleTime>=TUNNEL_CFG.ADAPTIVE_SAMPLE_INTERVAL){const elapsed=(now-lastSampleTime)/1000;const speed=downBytes/elapsed;const avgSize=downBytes/downPackets;if(speed>=TUNNEL_CFG.DIRECT_SPEED_THRESHOLD&&avgSize>=TUNNEL_CFG.DIRECT_AVG_SIZE_THRESHOLD){currentMode='direct';}else if(speed<=TUNNEL_CFG.BUFFERED_SPEED_THRESHOLD||avgSize<=TUNNEL_CFG.BUFFERED_AVG_SIZE_THRESHOLD){currentMode='buffered';}else{currentMode='adaptive';}stateRef.downMode=currentMode;downBytes=0;downPackets=0;lastSampleTime=now;}};try{for(;;){const{done,value}=await reader.read(new Uint8Array(buf,0,TUNNEL_CFG.READ_BUFFER_SIZE));if(done)break;if(!value?.byteLength)continue;stateRef.lastReadTime=Date.now();stateRef.stallCount=0;updateDownMode(value.byteLength);if(currentMode==='direct'){downstream.flush();webSocket.send(value);buf=new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);}else if(currentMode==='buffered'){downstream.add(value.slice());buf=value.buffer;}else{if(value.byteLength>=(TUNNEL_CFG.READ_BUFFER_SIZE>>1)){downstream.flush();webSocket.send(value);buf=new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);}else{downstream.add(value.slice());buf=value.buffer;}}}downstream.flush();}catch(_){downstream.flush();}finally{try{reader.releaseLock();}catch(_){}}}function startTimers(){clearInterval(state.heartbeatTimer);clearInterval(state.stallTimer);state.heartbeatTimer=setInterval(()=>{if(state.closed||!state.socket||!state.writer)return;const now=Date.now();if(now-state.lastWriteTime>=TUNNEL_CFG.HEARTBEAT_INTERVAL){state.writer.write(new Uint8Array(0)).catch(()=>{});state.lastWriteTime=Date.now();}},TUNNEL_CFG.HEARTBEAT_INTERVAL/3);state.stallTimer=setInterval(()=>{if(state.closed||!state.socket)return;if(Date.now()-state.lastReadTime>TUNNEL_CFG.STALL_TIMEOUT){state.stallCount++;if(state.stallCount>=TUNNEL_CFG.MAX_STALL_COUNT){handleSocketClose();}}else{state.stallCount=0;}},TUNNEL_CFG.STALL_TIMEOUT/2);}function cleanSocket(){try{state.writer?.releaseLock();}catch(_){}try{state.socket?.close();}catch(_){}state.socket=null;state.writer=null;}function handleSocketClose(){if(state.closed)return;cleanSocket();if(!upstreamQueue.isEmpty||state.target){queueMicrotask(drainQueue);}}async function doConnect(target,isReconnect){const{hostname,port,payload}=target;let sock;try{sock=await raceConnections(hostname,port,isReconnect?null:payload);}catch(_){const fallbackHost=getRandomFallback();try{sock=await createConnection(fallbackHost,port,isReconnect?null:payload);}catch(__){throw new Error('Connection failed');}}state.socket=sock;state.writer=sock.writable.getWriter();pipeSocketToWebSocket(sock.readable,serverWS,state).finally(()=>{if(!state.closed)handleSocketClose();});startTimers();state.reconnCount=0;state.stallCount=0;state.lastReadTime=Date.now();state.lastWriteTime=Date.now();serverWS.send(new Uint8Array([0,0]));}async function drainQueue(){if(processing||state.closed)return;processing=true;try{for(;;){if(state.closed)break;if(!state.socket){if(!state.target){const firstChunk=upstreamQueue.pop();if(!firstChunk)break;let parsed;try{parsed=parseInitialMessage(firstChunk);}catch(_){teardown();break;}state.target={hostname:parsed.hostname,port:parsed.port,payload:parsed.payload};try{await doConnect(state.target,false);}catch(_){teardown();break;}continue;}if(state.reconnecting)break;state.reconnecting=true;try{await doConnect(state.target,true);}catch(_){state.reconnCount++;if(state.reconnCount>TUNNEL_CFG.MAX_RECONNECT_COUNT){teardown();break;}state.reconnecting=false;break;}finally{state.reconnecting=false;}continue;}const[batch]=upstreamQueue.batch();if(!batch)break;try{await state.writer.write(batch);state.lastWriteTime=Date.now();}catch(_){handleSocketClose();break;}}}catch(_){if(!state.closed)handleSocketClose();}finally{processing=false;if(!upstreamQueue.isEmpty&&!state.closed){queueMicrotask(drainQueue);}}}if(earlyPayload)enqueue(earlyPayload);drainQueue();serverWS.addEventListener('message',(e)=>{if(state.closed)return;if(enqueue(e.data))drainQueue();});serverWS.addEventListener('close',()=>teardown());serverWS.addEventListener('error',()=>teardown());return new Response(null,{status:101,webSocket:clientWS,headers:{'Sec-WebSocket-Extensions':''}});}
-async function DOHRequest(request){const url=new URL(request.url);const{method,headers,body}=request;const UA=headers.get('User-Agent')||'DoH Client';const{searchParams}=url;const dnsDoH=`https://${DoH}/dns-query`;const jsonDoH=`https://${DoH}/resolve`;try{if(method==='GET'&&!url.search){return new Response('Bad Request',{status:400,headers:{'Content-Type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}let response;if(method==='GET'&&searchParams.has('name')){const q=searchParams.has('type')?url.search:url.search+'&type=A';response=await fetch(dnsDoH+q,{headers:{'Accept':'application/dns-json','User-Agent':UA}});if(!response.ok)response=await fetch(jsonDoH+q,{headers:{'Accept':'application/dns-json','User-Agent':UA}});}else if(method==='GET'){const rich=getRichHeaders();rich.set('Accept','application/dns-message');response=await fetch(dnsDoH+url.search,{headers:rich});}else if(method==='POST'){const rich=getRichHeaders();rich.set('Accept','application/dns-message');rich.set('Content-Type','application/dns-message');response=await fetch(dnsDoH,{method:'POST',headers:rich,body});}else{return new Response('Unsupported request format',{status:400,headers:{'Content-Type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}if(!response.ok){const errText=await response.text();throw new Error(`DoH error (${response.status}): ${errText.substring(0,200)}`);}const resHeaders=new Headers(response.headers);resHeaders.set('Access-Control-Allow-Origin','*');resHeaders.set('Access-Control-Allow-Methods','GET,POST,OPTIONS');resHeaders.set('Access-Control-Allow-Headers','*');if(method==='GET'&&searchParams.has('name')){resHeaders.set('Content-Type','application/json');}return new Response(response.body,{status:response.status,statusText:response.statusText,headers:resHeaders});}catch(error){return new Response(JSON.stringify({error:`DoH error: ${error.message}`,stack:error.stack},null,4),{status:500,headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}});}}
-async function corsProxy(request){const url=new URL(request.url);const inputUrl=url.searchParams.get('url');if(!inputUrl){return new Response('Missing ?url= parameter',{status:400,headers:{'content-type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}let targetURL;try{targetURL=new URL(inputUrl);}catch{return new Response('Invalid URL',{status:400,headers:{'content-type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}if(targetURL.protocol!=='http:'&&targetURL.protocol!=='https:'){return new Response('Unsupported protocol',{status:400,headers:{'Access-Control-Allow-Origin':'*'}});}const contentLength=parseInt(request.headers.get('Content-Length'),10);if(contentLength>CORS_MAX_BODY_SIZE){return new Response('Payload too large',{status:413,headers:{'content-type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}const newHeaders=getRichHeaders();newHeaders.set('Host',targetURL.host);newHeaders.set('Referer',targetURL.origin+'/');const skipHeaders=new Set(['host','cf-ray','cf-connecting-ip','cf-visitor','cf-worker','cdn-loop','x-forwarded-for','x-forwarded-proto','x-real-ip','connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','origin']);for(const[key,value]of request.headers){const lk=key.toLowerCase();if(skipHeaders.has(lk))continue;if(lk==='cookie'){newHeaders.set('Cookie',value);}else if(!newHeaders.has(key)){newHeaders.set(key,value);}}if(!newHeaders.has('Accept'))newHeaders.set('Accept','*/*');if(!newHeaders.has('Accept-Language'))newHeaders.set('Accept-Language','en-US,en;q=0.9');if(!newHeaders.has('Accept-Encoding'))newHeaders.set('Accept-Encoding','gzip, deflate, br');if(!newHeaders.has('Cache-Control'))newHeaders.set('Cache-Control','no-cache');if(!newHeaders.has('DNT'))newHeaders.set('DNT','1');if(!newHeaders.has('Sec-Fetch-Dest'))newHeaders.set('Sec-Fetch-Dest','document');if(!newHeaders.has('Sec-Fetch-Mode'))newHeaders.set('Sec-Fetch-Mode','navigate');if(!newHeaders.has('Sec-Fetch-Site'))newHeaders.set('Sec-Fetch-Site','none');if(!newHeaders.has('Sec-Fetch-User'))newHeaders.set('Sec-Fetch-User','?1');const upgradeHeader=request.headers.get('Upgrade');if(upgradeHeader&&upgradeHeader.toLowerCase()==='websocket'){const[client,server]=Object.values(new WebSocketPair());server.accept();const wsUrl=targetURL.toString().replace(/^http/,'ws');const upstream=new WebSocket(wsUrl);upstream.addEventListener('open',()=>{server.addEventListener('message',evt=>{if(upstream.readyState===WebSocket.READY_STATE_OPEN)upstream.send(evt.data);});});upstream.addEventListener('message',evt=>{if(server.readyState===WebSocket.READY_STATE_OPEN)server.send(evt.data);});upstream.addEventListener('close',()=>server.close());server.addEventListener('close',()=>upstream.close());upstream.addEventListener('error',()=>server.close());server.addEventListener('error',()=>upstream.close());return new Response(null,{status:101,webSocket:client});}let response;try{const init={method:request.method,headers:newHeaders,redirect:'manual'};if(request.method!=='GET'&&request.method!=='HEAD'&&request.body)init.body=request.body;response=await fetch(targetURL.toString(),init);}catch(err){return new Response(`Proxy Error: ${err.message}`,{status:502,headers:{'content-type':'text/plain; charset=utf-8','Access-Control-Allow-Origin':'*'}});}const resHeaders=new Headers(response.headers);const removeHeaders=['content-security-policy','content-security-policy-report-only','x-frame-options','x-content-type-options','x-xss-protection','strict-transport-security','referrer-policy','permissions-policy','cross-origin-embedder-policy','cross-origin-opener-policy','cross-origin-resource-policy','report-to','nel'];for(const h of removeHeaders)resHeaders.delete(h);const status=response.status;const location=resHeaders.get('Location');if(location&&status>=300&&status<400){try{const locUrl=new URL(location,targetURL.toString());const proxyBase=`${url.protocol}//${url.host}`;resHeaders.set('Location',`${proxyBase}/?url=${encodeURIComponent(locUrl.toString())}`);}catch{}}const setCookies=response.headers.getSetCookie?.()??[];resHeaders.delete('set-cookie');for(const c of setCookies)resHeaders.append('Set-Cookie',c);resHeaders.set('Access-Control-Allow-Origin','*');resHeaders.set('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS');resHeaders.set('Access-Control-Allow-Headers','*');resHeaders.set('Access-Control-Max-Age','86400');return new Response(response.body,{status,statusText:response.statusText,headers:resHeaders});}
-function snowflakePage(){const html=`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Tor Snowflake Proxy</title><style>@import url('https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Noto+Sans+SC:wght@300;400;500&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Patrick Hand','Noto Sans SC',cursive,sans-serif;background-color:#faf8f5;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:60px 20px;color:#4a4a4a}h1{font-size:2.8rem;font-weight:400;margin-bottom:20px;letter-spacing:1px;color:#3a3a3a}.subtitle{font-size:1.3rem;color:#666;text-align:center;max-width:600px;line-height:1.6;margin-bottom:50px;font-weight:300}.card{background-color:#fff;border-radius:16px;padding:20px;width:100%;max-width:560px;box-shadow:0 8px 32px rgba(0,0,0,0.12);position:relative;overflow:hidden}.card iframe{width:100%;height:250px;border:none;border-radius:8px;display:block}.footer-link{margin-top:40px;color:#0891b2;text-decoration:none;font-size:1.2rem;transition:color 0.2s;font-family:'Patrick Hand',cursive}.footer-link:hover{color:#0e7490;text-decoration:underline}@media(max-width:600px){h1{font-size:2rem}.card{padding:15px}.card iframe{height:420px}}</style></head><body><h1>Tor Snowflake proxy</h1><p class="subtitle">Keep this page open to help others bypass internet censorship and access the free internet.</p><div class="card"><iframe src="https://snowflake.torproject.org/embed.html"></iframe></div><a href="https://snowflake.torproject.org/" target="_blank" class="footer-link">about Snowflake</a></body></html>`;return new Response(html,{headers:{'content-type':'text/html; charset=utf-8'}});}
-export default{async fetch(request){const url=new URL(request.url);const path=url.pathname;if(request.method==='OPTIONS'){return new Response(null,{headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'*','Access-Control-Max-Age':'86400'}});}if(path===`/${dohPath}`){return await DOHRequest(request);}if(url.searchParams.has('url')){return await corsProxy(request);}const upgrade=(request.headers.get('upgrade')||'').toLowerCase();if(upgrade==='websocket'){return upgradeHandler(request);}return snowflakePage();}};
+import { connect as cloudflareConnect } from 'cloudflare:sockets';
+
+const PEER_UUID = 'ca6a7a70-4d44-433f-b727-1ed22ae7bf23';
+const FALLBACK_HOSTS = [
+  'ProxyIP.CMLiussss.net',
+  'ProxyIP.HK.CMLiussss.net',
+  'ProxyIP.SG.CMLiussss.net',
+  'ProxyIP.JP.CMLiussss.net',
+  'ProxyIP.KR.CMLiussss.net',
+  'ProxyIP.IN.CMLiussss.net',
+  'ProxyIP.GB.CMLiussss.net',
+  'ProxyIP.FR.CMLiussss.net',
+  'ProxyIP.DE.CMLiussss.net',
+  'ProxyIP.NL.CMLiussss.net',
+  'ProxyIP.SE.CMLiussss.net',
+  'ProxyIP.FI.CMLiussss.net',
+  'ProxyIP.PL.CMLiussss.net',
+  'ProxyIP.RU.CMLiussss.net',
+  'ProxyIP.CH.CMLiussss.net',
+  'ProxyIP.LV.CMLiussss.net',
+  'ProxyIP.US.CMLiussss.net',
+  'ProxyIP.CA.CMLiussss.net',
+  'kr.william.us.ci',
+  'tw.william.us.ci',
+  'proxy.mia.xx.kg'
+];
+
+function getRandomFallback() {
+  const idx = Math.floor(Math.random() * FALLBACK_HOSTS.length);
+  return FALLBACK_HOSTS[idx];
+}
+
+const TUNNEL_CFG = {
+  READ_BUFFER_SIZE: 128 * 1024,
+  DOWN_BATCH_SIZE: 64 * 1024,
+  DOWN_TAIL_THRESHOLD: 256,
+  DOWN_FLUSH_DELAY: 1,
+  UP_BATCH_SIZE: 32 * 1024,
+  UP_QUEUE_LIMIT: 128 * 1024,
+  CONNECTION_RACE_COUNT: 3,
+  HEARTBEAT_INTERVAL: 15000,
+  STALL_TIMEOUT: 8000,
+  MAX_STALL_COUNT: 12,
+  MAX_RECONNECT_COUNT: 15,
+  DIRECT_SPEED_THRESHOLD: 10 * 1024 * 1024,
+  DIRECT_AVG_SIZE_THRESHOLD: 16384,
+  BUFFERED_SPEED_THRESHOLD: 2 * 1024 * 1024,
+  BUFFERED_AVG_SIZE_THRESHOLD: 4096,
+  ADAPTIVE_SAMPLE_INTERVAL: 1000
+};
+
+const CORS_MAX_BODY_SIZE = 52428800;
+
+const UA_LIST = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0'
+];
+
+function getRichHeaders() {
+  const h = new Headers();
+  h.set('User-Agent', UA_LIST[Math.floor(Math.random() * UA_LIST.length)]);
+  h.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7');
+  h.set('Accept-Language', 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7');
+  h.set('Accept-Encoding', 'gzip, deflate, br');
+  h.set('Cache-Control', 'no-cache');
+  h.set('DNT', '1');
+  h.set('Sec-Fetch-Dest', 'document');
+  h.set('Sec-Fetch-Mode', 'navigate');
+  h.set('Sec-Fetch-Site', 'none');
+  h.set('Sec-Fetch-User', '?1');
+  h.set('Upgrade-Insecure-Requests', '1');
+  return h;
+}
+
+function base64UrlToBytes(header) {
+  if (!header) return null;
+  try {
+    const raw = atob(header.replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from(raw, c => c.charCodeAt(0));
+  } catch (_) {
+    return null;
+  }
+}
+
+function createCoalescingQueue(maxBatchSize, maxQueueBytes = maxBatchSize, maxItems = Math.max(1, maxQueueBytes >> 8)) {
+  let items = [];
+  let head = 0;
+  let totalBytes = 0;
+  let batchBuffer = null;
+
+  function trim() {
+    if (head > 32 && head * 2 >= items.length) {
+      items = items.slice(head);
+      head = 0;
+    }
+  }
+
+  function pop() {
+    if (head >= items.length) return null;
+    const chunk = items[head];
+    items[head++] = undefined;
+    totalBytes -= chunk.byteLength;
+    trim();
+    return chunk;
+  }
+
+  return {
+    get byteCount() { return totalBytes; },
+    get length() { return items.length - head; },
+    get isEmpty() { return head >= items.length; },
+    reset() {
+      items = [];
+      head = 0;
+      totalBytes = 0;
+    },
+    push(chunk) {
+      const size = chunk?.byteLength || 0;
+      if (!size) return 1;
+      if (totalBytes + size > maxQueueBytes || (items.length - head) >= maxItems) return 0;
+      items.push(chunk);
+      totalBytes += size;
+      return 1;
+    },
+    pop,
+    batch(firstChunk) {
+      if (firstChunk === undefined) firstChunk = pop();
+      if (!firstChunk || head >= items.length || firstChunk.byteLength >= maxBatchSize) {
+        return [firstChunk, 0];
+      }
+      let combinedSize = firstChunk.byteLength;
+      let end = head;
+      while (end < items.length) {
+        const next = items[end];
+        const nextSize = combinedSize + next.byteLength;
+        if (nextSize > maxBatchSize) break;
+        combinedSize = nextSize;
+        end++;
+      }
+      if (end === head) return [firstChunk, 0];
+      const buffer = batchBuffer ||= new Uint8Array(maxBatchSize);
+      buffer.set(firstChunk);
+      let offset = firstChunk.byteLength;
+      while (head < end) {
+        const next = items[head];
+        items[head++] = undefined;
+        totalBytes -= next.byteLength;
+        buffer.set(next, offset);
+        offset += next.byteLength;
+      }
+      trim();
+      return [buffer.subarray(0, combinedSize), 1];
+    },
+  };
+}
+
+function createDownstreamBuffer(webSocket) {
+  const batchSize = TUNNEL_CFG.DOWN_BATCH_SIZE;
+  const tailThreshold = TUNNEL_CFG.DOWN_TAIL_THRESHOLD;
+  const flushThreshold = Math.max(4096, tailThreshold << 3);
+  let buffer = new Uint8Array(batchSize);
+  let pos = 0;
+  let flushTimer = 0;
+  let microtaskScheduled = 0;
+  let addCounter = 0;
+  let addSnapshot = 0;
+  let retryCount = 0;
+
+  function flush() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = 0;
+    microtaskScheduled = 0;
+    if (!pos) return;
+    webSocket.send(buffer.subarray(0, pos));
+    buffer = new Uint8Array(batchSize);
+    pos = 0;
+    retryCount = 0;
+  }
+
+  function scheduleFlush() {
+    if (flushTimer || microtaskScheduled) return;
+    microtaskScheduled = 1;
+    addSnapshot = addCounter;
+    queueMicrotask(() => {
+      microtaskScheduled = 0;
+      if (!pos || flushTimer) return;
+      if (batchSize - pos < tailThreshold) return flush();
+      flushTimer = setTimeout(() => {
+        flushTimer = 0;
+        if (!pos) return;
+        if (batchSize - pos < tailThreshold) return flush();
+        if (retryCount < 2 && (addCounter !== addSnapshot || pos < flushThreshold)) {
+          retryCount++;
+          addSnapshot = addCounter;
+          return scheduleFlush();
+        }
+        flush();
+      }, Math.max(TUNNEL_CFG.DOWN_FLUSH_DELAY, 1));
+    });
+  }
+
+  return {
+    add(chunk) {
+      let offset = 0;
+      const len = chunk?.byteLength || 0;
+      if (!len) return;
+      while (offset < len) {
+        if (!pos && len - offset >= batchSize) {
+          const partSize = Math.min(batchSize, len - offset);
+          webSocket.send(offset || partSize !== len ? chunk.subarray(offset, offset + partSize) : chunk);
+          offset += partSize;
+          continue;
+        }
+        const partSize = Math.min(batchSize - pos, len - offset);
+        buffer.set(chunk.subarray(offset, offset + partSize), pos);
+        pos += partSize;
+        offset += partSize;
+        addCounter++;
+        if (pos === batchSize || batchSize - pos < tailThreshold) {
+          flush();
+        } else {
+          scheduleFlush();
+        }
+      }
+    },
+    flush,
+  };
+}
+
+function parseInitialMessage(packet) {
+  if (packet.length < 19) throw new Error('Invalid packet');
+  const uuidHex = [...packet.slice(1, 17)].map(b => b.toString(16).padStart(2, '0')).join('');
+  if (uuidHex !== PEER_UUID.replace(/-/g, '')) throw new Error('UUID mismatch');
+  const addressLength = packet[17];
+  let offset = 18 + addressLength + 1;
+  const port = (packet[offset] << 8) | packet[offset + 1];
+  offset += 2;
+  const addrType = packet[offset++];
+  let hostname = '';
+  if (addrType === 1) {
+    hostname = [...packet.slice(offset, offset + 4)].join('.');
+    offset += 4;
+  } else if (addrType === 2) {
+    const len = packet[offset++];
+    hostname = new TextDecoder().decode(packet.slice(offset, offset + len));
+    offset += len;
+  } else if (addrType === 3) {
+    const raw = packet.slice(offset, offset + 16);
+    hostname = [...Array(8)].map((_, idx) => ((raw[idx * 2] << 8) | raw[idx * 2 + 1]).toString(16)).join(':');
+    offset += 16;
+  } else {
+    throw new Error('Unknown address type');
+  }
+  const payload = packet.slice(offset);
+  return { hostname, port, payload };
+}
+
+function createConnection(hostname, port, initialData) {
+  const socket = cloudflareConnect({ hostname, port });
+  return new Promise((resolve, reject) => {
+    socket.opened.then(() => {
+      if (initialData?.byteLength) {
+        const writer = socket.writable.getWriter();
+        writer.write(initialData).then(() => {
+          writer.releaseLock();
+          resolve(socket);
+        }).catch(reject);
+      } else {
+        resolve(socket);
+      }
+    }).catch(reject);
+  });
+}
+
+function raceConnections(hostname, port, initialData) {
+  const raceCount = TUNNEL_CFG.CONNECTION_RACE_COUNT;
+  if (raceCount <= 1) return createConnection(hostname, port, initialData);
+  const attempts = Array(raceCount).fill().map(() => createConnection(hostname, port, initialData));
+  return Promise.any(attempts).then(winner => {
+    attempts.forEach(p => p.then(s => {
+      if (s !== winner) s.close();
+    }).catch(() => {}));
+    return winner;
+  });
+}
+
+async function upgradeHandler(request) {
+  const [clientWS, serverWS] = Object.values(new WebSocketPair());
+  serverWS.accept({ allowHalfOpen: true });
+  serverWS.binaryType = 'arraybuffer';
+
+  const earlyPayload = base64UrlToBytes(request.headers.get('sec-websocket-protocol') || '');
+
+  const state = {
+    socket: null,
+    writer: null,
+    target: null,
+    closed: false,
+    reconnCount: 0,
+    stallCount: 0,
+    lastReadTime: Date.now(),
+    lastWriteTime: Date.now(),
+    heartbeatTimer: null,
+    stallTimer: null,
+    reconnecting: false,
+    downMode: 'adaptive'
+  };
+
+  const upstreamQueue = createCoalescingQueue(TUNNEL_CFG.UP_BATCH_SIZE, TUNNEL_CFG.UP_QUEUE_LIMIT);
+  let processing = false;
+
+  function teardown() {
+    if (state.closed) return;
+    state.closed = true;
+    clearInterval(state.heartbeatTimer);
+    clearInterval(state.stallTimer);
+    upstreamQueue.reset();
+    try { state.writer?.releaseLock(); } catch (_) {}
+    try { state.socket?.close(); } catch (_) {}
+    try { serverWS.close(); } catch (_) {}
+  }
+
+  function asUint8Array(data) {
+    if (data instanceof Uint8Array) return data;
+    if (ArrayBuffer.isView(data)) {
+      return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    }
+    return new Uint8Array(data);
+  }
+
+  function enqueue(data) {
+    const chunk = asUint8Array(data);
+    if (!chunk.byteLength) return 1;
+    if (upstreamQueue.push(chunk)) return 1;
+    teardown();
+    return 0;
+  }
+
+  async function pipeSocketToWebSocket(readable, webSocket, stateRef) {
+    const reader = readable.getReader({ mode: 'byob' });
+    const downstream = createDownstreamBuffer(webSocket);
+    let buf = new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);
+    let downBytes = 0;
+    let downPackets = 0;
+    let lastSampleTime = Date.now();
+    let currentMode = 'adaptive';
+
+    const updateDownMode = (size) => {
+      downBytes += size;
+      downPackets++;
+      const now = Date.now();
+      if (now - lastSampleTime >= TUNNEL_CFG.ADAPTIVE_SAMPLE_INTERVAL) {
+        const elapsed = (now - lastSampleTime) / 1000;
+        const speed = downBytes / elapsed;
+        const avgSize = downBytes / downPackets;
+        if (speed >= TUNNEL_CFG.DIRECT_SPEED_THRESHOLD && avgSize >= TUNNEL_CFG.DIRECT_AVG_SIZE_THRESHOLD) {
+          currentMode = 'direct';
+        } else if (speed <= TUNNEL_CFG.BUFFERED_SPEED_THRESHOLD || avgSize <= TUNNEL_CFG.BUFFERED_AVG_SIZE_THRESHOLD) {
+          currentMode = 'buffered';
+        } else {
+          currentMode = 'adaptive';
+        }
+        stateRef.downMode = currentMode;
+        downBytes = 0;
+        downPackets = 0;
+        lastSampleTime = now;
+      }
+    };
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read(new Uint8Array(buf, 0, TUNNEL_CFG.READ_BUFFER_SIZE));
+        if (done) break;
+        if (!value?.byteLength) continue;
+        stateRef.lastReadTime = Date.now();
+        stateRef.stallCount = 0;
+        updateDownMode(value.byteLength);
+        if (currentMode === 'direct') {
+          downstream.flush();
+          webSocket.send(value);
+          buf = new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);
+        } else if (currentMode === 'buffered') {
+          downstream.add(value.slice());
+          buf = value.buffer;
+        } else {
+          if (value.byteLength >= (TUNNEL_CFG.READ_BUFFER_SIZE >> 1)) {
+            downstream.flush();
+            webSocket.send(value);
+            buf = new ArrayBuffer(TUNNEL_CFG.READ_BUFFER_SIZE);
+          } else {
+            downstream.add(value.slice());
+            buf = value.buffer;
+          }
+        }
+      }
+      downstream.flush();
+    } catch (_) {
+      downstream.flush();
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+    }
+  }
+
+  function startTimers() {
+    clearInterval(state.heartbeatTimer);
+    clearInterval(state.stallTimer);
+    state.heartbeatTimer = setInterval(() => {
+      if (state.closed || !state.socket || !state.writer) return;
+      const now = Date.now();
+      if (now - state.lastWriteTime >= TUNNEL_CFG.HEARTBEAT_INTERVAL) {
+        state.writer.write(new Uint8Array(0)).catch(() => {});
+        state.lastWriteTime = Date.now();
+      }
+    }, TUNNEL_CFG.HEARTBEAT_INTERVAL / 3);
+    state.stallTimer = setInterval(() => {
+      if (state.closed || !state.socket) return;
+      if (Date.now() - state.lastReadTime > TUNNEL_CFG.STALL_TIMEOUT) {
+        state.stallCount++;
+        if (state.stallCount >= TUNNEL_CFG.MAX_STALL_COUNT) {
+          handleSocketClose();
+        }
+      } else {
+        state.stallCount = 0;
+      }
+    }, TUNNEL_CFG.STALL_TIMEOUT / 2);
+  }
+
+  function cleanSocket() {
+    try { state.writer?.releaseLock(); } catch (_) {}
+    try { state.socket?.close(); } catch (_) {}
+    state.socket = null;
+    state.writer = null;
+  }
+
+  function handleSocketClose() {
+    if (state.closed) return;
+    cleanSocket();
+    if (!upstreamQueue.isEmpty || state.target) {
+      queueMicrotask(drainQueue);
+    }
+  }
+
+  async function doConnect(target, isReconnect) {
+    const { hostname, port, payload } = target;
+    let sock;
+    try {
+      sock = await raceConnections(hostname, port, isReconnect ? null : payload);
+    } catch (_) {
+      const fallbackHost = getRandomFallback();
+      try {
+        sock = await createConnection(fallbackHost, port, isReconnect ? null : payload);
+      } catch (__) {
+        throw new Error('Connection failed');
+      }
+    }
+    state.socket = sock;
+    state.writer = sock.writable.getWriter();
+    pipeSocketToWebSocket(sock.readable, serverWS, state).finally(() => {
+      if (!state.closed) handleSocketClose();
+    });
+    startTimers();
+    state.reconnCount = 0;
+    state.stallCount = 0;
+    state.lastReadTime = Date.now();
+    state.lastWriteTime = Date.now();
+    serverWS.send(new Uint8Array([0, 0]));
+  }
+
+  async function drainQueue() {
+    if (processing || state.closed) return;
+    processing = true;
+    try {
+      for (;;) {
+        if (state.closed) break;
+        if (!state.socket) {
+          if (!state.target) {
+            const firstChunk = upstreamQueue.pop();
+            if (!firstChunk) break;
+            let parsed;
+            try {
+              parsed = parseInitialMessage(firstChunk);
+            } catch (_) {
+              teardown();
+              break;
+            }
+            state.target = { hostname: parsed.hostname, port: parsed.port, payload: parsed.payload };
+            try {
+              await doConnect(state.target, false);
+            } catch (_) {
+              teardown();
+              break;
+            }
+            continue;
+          }
+          if (state.reconnecting) break;
+          state.reconnecting = true;
+          try {
+            await doConnect(state.target, true);
+          } catch (_) {
+            state.reconnCount++;
+            if (state.reconnCount > TUNNEL_CFG.MAX_RECONNECT_COUNT) {
+              teardown();
+              break;
+            }
+            state.reconnecting = false;
+            break;
+          } finally {
+            state.reconnecting = false;
+          }
+          continue;
+        }
+        const [batch] = upstreamQueue.batch();
+        if (!batch) break;
+        try {
+          await state.writer.write(batch);
+          state.lastWriteTime = Date.now();
+        } catch (_) {
+          handleSocketClose();
+          break;
+        }
+      }
+    } catch (_) {
+      if (!state.closed) handleSocketClose();
+    } finally {
+      processing = false;
+      if (!upstreamQueue.isEmpty && !state.closed) {
+        queueMicrotask(drainQueue);
+      }
+    }
+  }
+
+  if (earlyPayload) enqueue(earlyPayload);
+  drainQueue();
+
+  serverWS.addEventListener('message', (e) => {
+    if (state.closed) return;
+    if (enqueue(e.data)) drainQueue();
+  });
+  serverWS.addEventListener('close', () => teardown());
+  serverWS.addEventListener('error', () => teardown());
+
+  return new Response(null, {
+    status: 101,
+    webSocket: clientWS,
+    headers: { 'Sec-WebSocket-Extensions': '' }
+  });
+}
+
+async function corsProxy(request) {
+  const url = new URL(request.url);
+  const inputUrl = url.searchParams.get('url');
+  if (!inputUrl) {
+    return new Response('Missing ?url= parameter', {
+      status: 400,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+  let targetURL;
+  try {
+    targetURL = new URL(inputUrl);
+  } catch {
+    return new Response('Invalid URL', {
+      status: 400,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+  if (targetURL.protocol !== 'http:' && targetURL.protocol !== 'https:') {
+    return new Response('Unsupported protocol', {
+      status: 400,
+      headers: { 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+  const contentLength = parseInt(request.headers.get('Content-Length'), 10);
+  if (contentLength > CORS_MAX_BODY_SIZE) {
+    return new Response('Payload too large', {
+      status: 413,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+  const newHeaders = getRichHeaders();
+  newHeaders.set('Host', targetURL.host);
+  newHeaders.set('Referer', targetURL.origin + '/');
+  const skipHeaders = new Set([
+    'host', 'cf-ray', 'cf-connecting-ip', 'cf-visitor', 'cf-worker', 'cdn-loop',
+    'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip', 'connection', 'keep-alive',
+    'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding',
+    'upgrade', 'origin'
+  ]);
+  for (const [key, value] of request.headers) {
+    const lk = key.toLowerCase();
+    if (skipHeaders.has(lk)) continue;
+    if (lk === 'cookie') {
+      newHeaders.set('Cookie', value);
+    } else if (!newHeaders.has(key)) {
+      newHeaders.set(key, value);
+    }
+  }
+  if (!newHeaders.has('Accept')) newHeaders.set('Accept', '*/*');
+  if (!newHeaders.has('Accept-Language')) newHeaders.set('Accept-Language', 'en-US,en;q=0.9');
+  if (!newHeaders.has('Accept-Encoding')) newHeaders.set('Accept-Encoding', 'gzip, deflate, br');
+  if (!newHeaders.has('Cache-Control')) newHeaders.set('Cache-Control', 'no-cache');
+  if (!newHeaders.has('DNT')) newHeaders.set('DNT', '1');
+  if (!newHeaders.has('Sec-Fetch-Dest')) newHeaders.set('Sec-Fetch-Dest', 'document');
+  if (!newHeaders.has('Sec-Fetch-Mode')) newHeaders.set('Sec-Fetch-Mode', 'navigate');
+  if (!newHeaders.has('Sec-Fetch-Site')) newHeaders.set('Sec-Fetch-Site', 'none');
+  if (!newHeaders.has('Sec-Fetch-User')) newHeaders.set('Sec-Fetch-User', '?1');
+
+  const upgradeHeader = request.headers.get('Upgrade');
+  if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    const wsUrl = targetURL.toString().replace(/^http/, 'ws');
+    const upstream = new WebSocket(wsUrl);
+    upstream.addEventListener('open', () => {
+      server.addEventListener('message', evt => {
+        if (upstream.readyState === WebSocket.READY_STATE_OPEN) upstream.send(evt.data);
+      });
+    });
+    upstream.addEventListener('message', evt => {
+      if (server.readyState === WebSocket.READY_STATE_OPEN) server.send(evt.data);
+    });
+    upstream.addEventListener('close', () => server.close());
+    server.addEventListener('close', () => upstream.close());
+    upstream.addEventListener('error', () => server.close());
+    server.addEventListener('error', () => upstream.close());
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  let response;
+  try {
+    const init = { method: request.method, headers: newHeaders, redirect: 'manual' };
+    if (request.method !== 'GET' && request.method !== 'HEAD' && request.body) init.body = request.body;
+    response = await fetch(targetURL.toString(), init);
+  } catch (err) {
+    return new Response(`Proxy Error: ${err.message}`, {
+      status: 502,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+  const resHeaders = new Headers(response.headers);
+  const removeHeaders = [
+    'content-security-policy', 'content-security-policy-report-only',
+    'x-frame-options', 'x-content-type-options', 'x-xss-protection',
+    'strict-transport-security', 'referrer-policy', 'permissions-policy',
+    'cross-origin-embedder-policy', 'cross-origin-opener-policy',
+    'cross-origin-resource-policy', 'report-to', 'nel'
+  ];
+  for (const h of removeHeaders) resHeaders.delete(h);
+  const status = response.status;
+  const location = resHeaders.get('Location');
+  if (location && status >= 300 && status < 400) {
+    try {
+      const locUrl = new URL(location, targetURL.toString());
+      const proxyBase = `${url.protocol}//${url.host}`;
+      resHeaders.set('Location', `${proxyBase}/?url=${encodeURIComponent(locUrl.toString())}`);
+    } catch {}
+  }
+  const setCookies = response.headers.getSetCookie?.() ?? [];
+  resHeaders.delete('set-cookie');
+  for (const c of setCookies) resHeaders.append('Set-Cookie', c);
+  resHeaders.set('Access-Control-Allow-Origin', '*');
+  resHeaders.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS');
+  resHeaders.set('Access-Control-Allow-Headers', '*');
+  resHeaders.set('Access-Control-Max-Age', '86400');
+  return new Response(response.body, {
+    status,
+    statusText: response.statusText,
+    headers: resHeaders
+  });
+}
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400'
+        }
+      });
+    }
+
+    if (url.searchParams.has('url')) {
+      return await corsProxy(request);
+    }
+
+    const upgrade = (request.headers.get('upgrade') || '').toLowerCase();
+    if (upgrade === 'websocket') {
+      return upgradeHandler(request);
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+};
